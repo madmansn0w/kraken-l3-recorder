@@ -1,54 +1,119 @@
 #!/usr/bin/env python3
 """
-Coinbase L3 (full) WebSocket recorder.
+Kraken L3 (level3) WebSocket recorder.
 
-Connects to wss://ws-feed.exchange.coinbase.com, subscribes to the "full"
-channel for configurable product IDs, and writes each message as a single
-NDJSON line. Rotates output file by calendar day (UTC). Reconnects with
-exponential backoff on disconnect. Handles SIGTERM/SIGINT for clean shutdown.
+Retrieves a session token from Kraken REST (GetWebSocketsToken), connects to
+wss://ws-l3.kraken.com/v2, subscribes to the level3 channel for configured
+symbols and depth, and writes each message as a single NDJSON line. Rotates
+output file by calendar day (UTC). Reconnects with exponential backoff on
+disconnect. Refreshes the token on each connection (tokens are valid 15 minutes
+but do not expire while the connection is maintained). Handles SIGTERM/SIGINT
+for clean shutdown.
+
+Requires Kraken API key with "WebSocket interface - On". Set api_key and
+api_secret in config or via KRAKEN_API_KEY, KRAKEN_API_SECRET.
 
 Usage:
   pip install -r requirements.txt
-  cp config.yaml.example config.yaml   # edit product_ids, output_dir
+  cp config.yaml.example config.yaml   # edit symbols, output_dir, auth
   python record_l3.py
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import signal
 import sys
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 import websockets
 import yaml
 
-WS_URL = "wss://ws-feed.exchange.coinbase.com"
+# Kraken REST (token) and WebSocket L3 endpoints.
+REST_BASE = "https://api.kraken.com"
+GET_WS_TOKEN_PATH = "/0/private/GetWebSocketsToken"
+WS_L3_URL = "wss://ws-l3.kraken.com/v2"
+
 CONFIG_PATH = Path("config.yaml")
 BACKOFF_INIT = 1.0
 BACKOFF_MAX = 60.0
 BACKOFF_MULT = 2.0
 FLUSH_EVERY_N = 100
 
+# Token is valid 15 min; we get a new one on each reconnect.
+TOKEN_VALIDITY_SEC = 900
+
 
 def load_config() -> dict:
     """Load config from config.yaml or env; fall back to defaults."""
     defaults = {
-        "product_ids": ["BTC-USD"],
+        "symbols": ["BTC/USD", "ETH/USD"],
+        "depth": 10,
         "output_dir": "data",
+        "api_key": None,
+        "api_secret": None,
     }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
             data = yaml.safe_load(f) or {}
         defaults.update(data)
-    product_ids = os.environ.get("COINBASE_L3_PRODUCT_IDS")
-    if product_ids:
-        defaults["product_ids"] = [p.strip() for p in product_ids.split(",")]
-    output_dir = os.environ.get("COINBASE_L3_OUTPUT_DIR")
+    symbols_env = os.environ.get("KRAKEN_L3_SYMBOLS")
+    if symbols_env:
+        defaults["symbols"] = [s.strip() for s in symbols_env.split(",")]
+    output_dir = os.environ.get("KRAKEN_L3_OUTPUT_DIR")
     if output_dir:
         defaults["output_dir"] = output_dir
+    if os.environ.get("KRAKEN_API_KEY"):
+        defaults["api_key"] = os.environ.get("KRAKEN_API_KEY")
+    if os.environ.get("KRAKEN_API_SECRET"):
+        defaults["api_secret"] = os.environ.get("KRAKEN_API_SECRET")
     return defaults
+
+
+def kraken_signature(urlpath: str, data: dict, secret_b64: str) -> str:
+    """
+    Kraken REST API-Sign: HMAC-SHA512( urlpath + SHA256(nonce + post_data), base64_decode(secret) ), base64.
+    """
+    post_data = urllib.parse.urlencode(data)
+    nonce = str(data["nonce"])
+    encoded = (nonce + post_data).encode("utf-8")
+    message = urlpath.encode("utf-8") + hashlib.sha256(encoded).digest()
+    secret = base64.b64decode(secret_b64)
+    mac = hmac.new(secret, message, hashlib.sha512)
+    return base64.b64encode(mac.digest()).decode("utf-8")
+
+
+def get_websockets_token(api_key: str, api_secret: str) -> str:
+    """
+    Request a WebSocket session token from Kraken REST.
+    Raises on HTTP or API error; returns the token string.
+    """
+    nonce = str(int(time.time() * 1000))
+    data = {"nonce": nonce}
+    urlpath = GET_WS_TOKEN_PATH
+    signature = kraken_signature(urlpath, data, api_secret)
+    url = REST_BASE + urlpath
+    headers = {
+        "API-Key": api_key,
+        "API-Sign": signature,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    resp = requests.post(url, data=data, headers=headers, timeout=15)
+    resp.raise_for_status()
+    out = resp.json()
+    if out.get("error") and out["error"]:
+        raise RuntimeError(f"Kraken API error: {out['error']}")
+    token = (out.get("result") or {}).get("token")
+    if not token:
+        raise RuntimeError("Kraken GetWebSocketsToken did not return a token")
+    return token
 
 
 def date_prefix() -> str:
@@ -57,15 +122,25 @@ def date_prefix() -> str:
 
 
 class Recorder:
-    def __init__(self, product_ids: list[str], output_dir: str):
-        self.product_ids = product_ids
+    def __init__(
+        self,
+        symbols: list[str],
+        depth: int,
+        output_dir: str,
+        api_key: str | None,
+        api_secret: str | None,
+    ):
+        self.symbols = symbols
+        self.depth = depth
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._api_key = api_key
+        self._api_secret = api_secret
         self._current_date: str | None = None
         self._file = None
         self._write_count = 0
         self._shutdown = False
-        self._ws = None  # set during run(); closed on shutdown to unblock recv
+        self._ws = None
 
     def _open_file(self) -> None:
         today = date_prefix()
@@ -101,18 +176,37 @@ class Recorder:
         backoff = BACKOFF_INIT
         while not self._shutdown:
             try:
+                if not self._api_key or not self._api_secret:
+                    print(
+                        "Error: Kraken L3 requires api_key and api_secret. Set in config or KRAKEN_API_KEY, KRAKEN_API_SECRET.",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(min(backoff, BACKOFF_MAX))
+                    backoff = min(backoff * BACKOFF_MULT, BACKOFF_MAX)
+                    continue
+                token = get_websockets_token(self._api_key, self._api_secret)
                 async with websockets.connect(
-                    WS_URL,
+                    WS_L3_URL,
                     ping_interval=30,
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
                     self._ws = ws
                     subscribe = {
-                        "type": "subscribe",
-                        "channels": [{"name": "full", "product_ids": self.product_ids}],
+                        "method": "subscribe",
+                        "params": {
+                            "channel": "level3",
+                            "symbol": self.symbols,
+                            "depth": self.depth,
+                            "snapshot": True,
+                            "token": token,
+                        },
                     }
                     await ws.send(json.dumps(subscribe))
+                    print(
+                        f"Subscribed to level3 symbols={self.symbols} depth={self.depth}.",
+                        file=sys.stderr,
+                    )
                     backoff = BACKOFF_INIT
                     while not self._shutdown:
                         raw = await ws.recv()
@@ -135,13 +229,30 @@ class Recorder:
 
 def main() -> None:
     config = load_config()
-    product_ids = config["product_ids"]
+    symbols = config["symbols"]
+    depth = config["depth"]
     output_dir = config["output_dir"]
-    if not product_ids:
-        print("No product_ids configured.", file=sys.stderr)
+    if not symbols:
+        print("No symbols configured.", file=sys.stderr)
+        sys.exit(1)
+    if depth not in (10, 100, 1000):
+        print("depth must be 10, 100, or 1000.", file=sys.stderr)
         sys.exit(1)
 
-    recorder = Recorder(product_ids=product_ids, output_dir=output_dir)
+    if not config.get("api_key") or not config.get("api_secret"):
+        print(
+            "Warning: No Kraken API key or secret set. L3 channel requires authentication. "
+            "Set api_key and api_secret in config or KRAKEN_API_KEY, KRAKEN_API_SECRET.",
+            file=sys.stderr,
+        )
+
+    recorder = Recorder(
+        symbols=symbols,
+        depth=depth,
+        output_dir=output_dir,
+        api_key=config.get("api_key"),
+        api_secret=config.get("api_secret"),
+    )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -155,7 +266,7 @@ def main() -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, shutdown_signal)
     except (ValueError, OSError):
-        pass  # Windows or unsupported
+        pass
 
     try:
         loop.run_until_complete(recorder.run())

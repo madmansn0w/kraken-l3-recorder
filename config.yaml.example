@@ -1,10 +1,21 @@
-# Coinbase L3 recorder config.
+# Kraken L3 recorder config.
 # Copy to config.yaml and adjust. Output directory is created if missing.
+#
+# L3 channel requires authentication. Set api_key and api_secret below, or use
+# env: KRAKEN_API_KEY, KRAKEN_API_SECRET. API key must have "WebSocket interface - On".
+# See https://docs.kraken.com/api/docs/guides/spot-ws-auth
 
-# Product IDs to subscribe to (Coinbase format, e.g. BTC-USD, ETH-USD).
-product_ids:
-  - BTC-USD
-  - ETH-USD
+# Symbols in Kraken format (e.g. BTC/USD, ETH/USD).
+symbols:
+  - BTC/USD
+  - ETH/USD
+
+# Order book depth: 10, 100, or 1000 levels. Deeper = more counter units per symbol.
+depth: 10
 
 # Directory for NDJSON output. One file per day (UTC): l3-YYYY-MM-DD.ndjson
 output_dir: data
+
+# Required for L3. Prefer env vars in production.
+# api_key: your-kraken-api-key
+# api_secret: your-kraken-api-secret
