@@ -310,7 +310,10 @@ def main() -> None:
 
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, shutdown_signal)
+            try:
+                loop.add_signal_handler(sig, shutdown_signal)
+            except NotImplementedError:
+                break
     except (ValueError, OSError):
         pass
 
