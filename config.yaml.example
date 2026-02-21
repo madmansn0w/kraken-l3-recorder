@@ -14,6 +14,10 @@ symbols:
 depth: 10
 
 # Directory for NDJSON output. One file per day (UTC): l3-YYYY-MM-DD.ndjson
+# Optional: rotate to a new file when current file reaches this size (MB).
+# Unset = rotate only by day.
+# max_file_size_mb: 500
+
 output_dir: data
 
 # Required for L3. Prefer env vars in production.

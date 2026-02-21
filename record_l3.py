@@ -5,7 +5,7 @@ Kraken L3 (level3) WebSocket recorder.
 Retrieves a session token from Kraken REST (GetWebSocketsToken), connects to
 wss://ws-l3.kraken.com/v2, subscribes to the level3 channel for configured
 symbols and depth, and writes each message as a single NDJSON line. Rotates
-output file by calendar day (UTC). Reconnects with exponential backoff on
+output file by calendar day (UTC) and optionally by max file size. Reconnects with exponential backoff on
 disconnect. Refreshes the token on each connection (tokens are valid 15 minutes
 but do not expire while the connection is maintained). Handles SIGTERM/SIGINT
 for clean shutdown.
@@ -57,6 +57,7 @@ def load_config() -> dict:
         "symbols": ["BTC/USD", "ETH/USD"],
         "depth": 10,
         "output_dir": "data",
+        "max_file_size_mb": None,
         "api_key": None,
         "api_secret": None,
     }
@@ -70,6 +71,12 @@ def load_config() -> dict:
     output_dir = os.environ.get("KRAKEN_L3_OUTPUT_DIR")
     if output_dir:
         defaults["output_dir"] = output_dir
+    max_mb_env = os.environ.get("KRAKEN_L3_MAX_FILE_SIZE_MB")
+    if max_mb_env is not None:
+        try:
+            defaults["max_file_size_mb"] = int(max_mb_env)
+        except ValueError:
+            pass
     if os.environ.get("KRAKEN_API_KEY"):
         defaults["api_key"] = os.environ.get("KRAKEN_API_KEY")
     if os.environ.get("KRAKEN_API_SECRET"):
@@ -129,6 +136,7 @@ class Recorder:
         output_dir: str,
         api_key: str | None,
         api_secret: str | None,
+        max_file_size_mb: int | None = None,
     ):
         self.symbols = symbols
         self.depth = depth
@@ -136,22 +144,58 @@ class Recorder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._api_key = api_key
         self._api_secret = api_secret
+        self._max_file_size_bytes: int | None = (
+            int(max_file_size_mb * 1024 * 1024) if max_file_size_mb is not None else None
+        )
         self._current_date: str | None = None
+        self._current_file_path: Path | None = None
         self._file = None
         self._write_count = 0
         self._shutdown = False
         self._ws = None
 
+    def _next_path_for_date(self, date_str: str) -> Path:
+        """
+        Return the next available output path for the given date (YYYY-MM-DD).
+        First file of the day uses l3-YYYY-MM-DD.ndjson; subsequent (size-rotated)
+        files use l3-YYYY-MM-DD-0001.ndjson, l3-YYYY-MM-DD-0002.ndjson, etc.
+        """
+        base = self.output_dir / f"l3-{date_str}.ndjson"
+        if not base.exists():
+            return base
+        n = 1
+        while (self.output_dir / f"l3-{date_str}-{n:04d}.ndjson").exists():
+            n += 1
+        return self.output_dir / f"l3-{date_str}-{n:04d}.ndjson"
+
     def _open_file(self) -> None:
         today = date_prefix()
-        if self._file is not None and self._current_date == today:
-            return
-        if self._file is not None:
+        # Rotate if date changed.
+        if self._file is not None and self._current_date != today:
             self._file.close()
             self._file = None
+            self._current_file_path = None
+            self._current_date = None
+        # Rotate if current file has reached max size.
+        if (
+            self._file is not None
+            and self._current_file_path is not None
+            and self._max_file_size_bytes is not None
+        ):
+            try:
+                current_size = os.path.getsize(self._current_file_path)
+                if current_size >= self._max_file_size_bytes:
+                    self._file.close()
+                    self._file = None
+                    self._current_file_path = None
+            except OSError:
+                pass
+        if self._file is not None:
+            return
         self._current_date = today
-        path = self.output_dir / f"l3-{today}.ndjson"
+        path = self._next_path_for_date(today)
         self._file = open(path, "a", encoding="utf-8")
+        self._current_file_path = path
 
     def write_message(self, raw: str) -> None:
         self._open_file()
@@ -171,6 +215,7 @@ class Recorder:
             self._file.close()
             self._file = None
         self._current_date = None
+        self._current_file_path = None
 
     async def run(self) -> None:
         backoff = BACKOFF_INIT
@@ -252,6 +297,7 @@ def main() -> None:
         output_dir=output_dir,
         api_key=config.get("api_key"),
         api_secret=config.get("api_secret"),
+        max_file_size_mb=config.get("max_file_size_mb"),
     )
 
     loop = asyncio.new_event_loop()

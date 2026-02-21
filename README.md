@@ -1,6 +1,6 @@
 # Kraken L3 recorder
 
-Records the **Kraken WebSocket level3 (L3) channel** to NDJSON files for later analysis or backtest. One line per message; files rotate by calendar day (UTC). Reconnects with exponential backoff on disconnect. Obtains a fresh session token from Kraken REST on each connection. Intended to run 24/7 on a machine that is always on.
+Records the **Kraken WebSocket level3 (L3) channel** to NDJSON files for later analysis or backtest. One line per message; files rotate by calendar day (UTC) and optionally by maximum file size. Reconnects with exponential backoff on disconnect. Obtains a fresh session token from Kraken REST on each connection. Intended to run 24/7 on a machine that is always on.
 
 **Authentication:** The L3 channel requires authentication. The script calls Kraken REST `GetWebSocketsToken` (with your API key/secret) and uses the token to subscribe. Set `api_key` and `api_secret` in config or via env. Your API key must have **"WebSocket interface - On"** (see [Kraken WebSocket auth](https://docs.kraken.com/api/docs/guides/spot-ws-auth)).
 
@@ -17,7 +17,7 @@ Records the **Kraken WebSocket level3 (L3) channel** to NDJSON files for later a
    cp config.yaml.example config.yaml
    ```
 
-2. Set `symbols` (Kraken format, e.g. `BTC/USD`, `ETH/USD`), `depth` (10, 100, or 1000), and `output_dir` (default `data/`). The output directory is created if missing.
+2. Set `symbols` (Kraken format, e.g. `BTC/USD`, `ETH/USD`), `depth` (10, 100, or 1000), `output_dir` (default `data/`), and optionally `max_file_size_mb` (max size in MB per file before rotating; unset = day-only rotation). The output directory is created if missing.
 
 3. **Required for L3:** Set Kraken API credentials. In `config.yaml` add `api_key` and `api_secret`, or use environment variables (preferred so secrets are not on disk).
 
@@ -25,6 +25,7 @@ You can override via environment:
 
 - `KRAKEN_L3_SYMBOLS` — comma-separated list (e.g. `BTC/USD,ETH/USD`)
 - `KRAKEN_L3_OUTPUT_DIR` — output directory path
+- `KRAKEN_L3_MAX_FILE_SIZE_MB` — max L3 file size in MB before rotating to a new file (optional)
 - `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` — for authenticated L3 channel
 
 ## Run
@@ -37,15 +38,15 @@ The script fetches a WebSocket token from Kraken REST, connects to `wss://ws-l3.
 
 ## Output
 
-- **Path:** `{output_dir}/l3-YYYY-MM-DD.ndjson`
+- **Path:** `{output_dir}/l3-YYYY-MM-DD.ndjson`, or `l3-YYYY-MM-DD-0001.ndjson`, `l3-YYYY-MM-DD-0002.ndjson`, … when rotating by size within the same day.
 - **Format:** One JSON message per line (newline-delimited JSON). Each line is the raw message from Kraken: `snapshot` (full book with order-level bids/asks) or `update` (add/modify/delete order events).
-- Files are appended to throughout the day; the next day a new file is opened.
+- Files are appended to throughout the day; the next day a new file is opened. If `max_file_size_mb` is set, a new file is created when the current file reaches that size (same day gets `-0001`, `-0002`, …).
 
 ## Running as a service (systemd)
 
 Create a user unit so the recorder runs on boot and restarts on failure.
 
-1. Install the repo and deps (e.g. in `~/github.com/coinbase-l3-recorder` with a venv or system pip).
+1. Install the repo and deps (e.g. in `~/github.com/kraken-l3-recorder` with a venv or system pip).
 
 2. Create `~/.config/systemd/user/kraken-l3-recorder.service`:
 
@@ -57,8 +58,8 @@ Create a user unit so the recorder runs on boot and restarts on failure.
 
    [Service]
    Type=simple
-   WorkingDirectory=%h/github.com/coinbase-l3-recorder
-   ExecStart=%h/github.com/coinbase-l3-recorder/venv/bin/python record_l3.py
+   WorkingDirectory=%h/github.com/kraken-l3-recorder
+   ExecStart=%h/github.com/kraken-l3-recorder/venv/bin/python record_l3.py
    Restart=always
    RestartSec=10
 
