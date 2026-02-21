@@ -1,0 +1,10 @@
+# Coinbase L3 recorder config.
+# Copy to config.yaml and adjust. Output directory is created if missing.
+
+# Product IDs to subscribe to (Coinbase format, e.g. BTC-USD, ETH-USD).
+product_ids:
+  - BTC-USD
+  - ETH-USD
+
+# Directory for NDJSON output. One file per day (UTC): l3-YYYY-MM-DD.ndjson
+output_dir: data

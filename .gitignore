@@ -1,0 +1,22 @@
+# Recorded data
+data/
+*.ndjson
+
+# Config (may contain local paths)
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
